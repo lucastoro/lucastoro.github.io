@@ -1,0 +1,371 @@
+
+<!doctype html>
+<html>
+	<head>
+		<title>Audio delay test</title>
+		<meta charset="UTF-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		<style>
+			html, body {
+				padding: 0;
+				margin: 0;
+			}
+			body {
+			    text-align: center;
+	    		padding: 10%;
+    		    font-family: monospace;
+    		    background-color: #111;
+    		    color: black;
+    		    overflow: hidden;
+			}
+			.button {
+				border: solid 1px black;
+			    padding: 16px 24px;
+			    display: inline-block;
+			    cursor: pointer;
+			    background-color: #A33;
+			    border-radius: 4px;
+			    font-size: 2em;
+			}
+			.button:hover {
+				color: #AAA;
+			}
+			#output {
+				color: #AAA;
+				margin: 32px;
+			}
+			.highlighted {
+				color: #AAA;
+			}
+			canvas {
+				width: 100%;
+			}
+    	</style>
+	</head>
+	<body>
+		<div class='button' id='play'>Play</div>
+		<div class='button' id='baseline'>Baseline</div>
+		<pre id='output'>Press 'Play' to start,
+click anywhere or press any key on the keyboard when you hear the sound to sample,
+press the button again or Esc to stop.
+
+Please note that this is meant to be a *differential* test,
+a single run does not mean anything,
+you are supposed to run this test with the target device (headphones/headset/speakers)
+and with a "reference" device to compare them.
+
+At least 30 samples are suggested for a meaningful test,
+also use of the keyboard is encouraged to minimize input lag.
+		</pre>
+		<canvas id='graph'>
+		</canvas>
+		<audio preload id='beep'>
+		  <source src="beep.ogg" type="audio/ogg">
+		Your browser does not support the audio element.
+		</audio>
+		
+		<script>
+		
+			'use strict';
+			
+			function draw(canvas, context, data, normalizer, red) {
+						
+				const W = canvas.width;
+				const H = canvas.height;
+				
+				const getX = i => (i / data.length) * W;
+				const getY = i => normalizer(data[i]) * H;
+				
+				context.strokeStyle = 'white';
+				context.clearRect(0, 0, W, H);
+				context.strokeRect(0, 0, W, H);
+				context.strokeRect(0, 0, W, H / 2);
+				
+				context.strokeStyle = red ? 'red' : 'green';
+				context.beginPath();
+				context.moveTo(getX(0), getY(0));
+				for (let i = 0; i < data.length; i++) {
+					if (i % 2 === 0) {
+						context.lineTo(getX(i), getY(i));
+					}
+				}
+				context.stroke();
+			}
+			
+			const feedbackContext = {
+				ready: false,
+				feedback: null,
+				stop: null,
+				count: 0,
+				last: null,
+				canvas: null,
+				context: null
+			};
+			
+			function isBaselining() {
+				return feedbackContext.count > 0;
+			}
+			
+			function cancelBaseline() {
+				feedbackContext.stop = null;
+				feedbackContext.count = 0;
+			}
+
+			function nextPowerOf2(val) {
+				let a = val;
+				let b = 1;
+				while (a) {
+					a = a >> 1;
+					b = b << 1;
+				}
+				return (b >> 1 == val) ? val : b;
+			}
+
+			function calculateBaseline(feedback, stop, count, canvas) {
+				
+				feedbackContext.feedback = feedback;
+				feedbackContext.stop = stop;
+				feedbackContext.count = count;
+				feedbackContext.canvas = canvas;
+				feedbackContext.context = canvas.getContext('2d');
+				
+				canvas.width = canvas.offsetWidth;
+				canvas.height = canvas.offsetHeight;
+				
+				const threashold = 0.2;
+				const useBytes = true;
+				const bufferDurationSec = 0.25; // this is approximate, the buffer must be a ^2
+				
+				if (!feedbackContext.ready) {
+				
+					navigator.mediaDevices.getUserMedia({audio: true}).then(function(stream){
+						
+						// audio subsystem setup
+						const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+						const inputNode = audioContext.createMediaStreamSource(stream);
+						const analyserNode = audioContext.createAnalyser();
+						const bufferLength = nextPowerOf2(inputNode.mediaStream.getAudioTracks()[0].getSettings().sampleRate * bufferDurationSec);
+						analyserNode.fftSize = bufferLength;
+						inputNode.connect(analyserNode);
+						
+						// buffer setup
+						const bufferCtor = useBytes ? Uint8Array : Float32Array;
+						const bufferReader = useBytes ? analyserNode.getByteTimeDomainData : analyserNode.getFloatTimeDomainData;
+						const bufferNormalizer = useBytes ? (x => x / 255.0) : (x => x * 0.5 + 0.5); // normalizer: (x) -> [0.0 - 1.0]
+						const buffer = new bufferCtor(analyserNode.fftSize);
+						
+						const listen = function() {
+							
+							if (feedbackContext.count > 0) {
+								
+								bufferReader.call(analyserNode, buffer)
+								
+								const gotit = buffer.some(v => bufferNormalizer(v) - 0.5 > threashold);
+								
+								draw(feedbackContext.canvas, feedbackContext.context, buffer, bufferNormalizer, gotit);
+
+								if (gotit && feedbackContext.feedback()) {
+									feedbackContext.count -= 1;
+								}
+								
+								if (feedbackContext.count === 0 && feedbackContext.count !== null) {
+									feedbackContext.stop();
+								}
+							}
+							
+							requestAnimationFrame(listen);	
+						}
+						
+						feedbackContext.ready = true;
+						listen();
+					});
+				}
+			}
+			
+		</script>
+		
+		<script>
+			'use strict';
+			
+			const beep = document.getElementById('beep');
+			const play = document.getElementById('play');
+			const base = document.getElementById('baseline');
+			const canvas = document.getElementById('graph');
+			const minDelay = 300.0;
+			const maxDelay = 1000.0;
+			
+			let playing = false;    // is the system running
+			let timeout = null; // the timeout handler
+			let before = null;  // the time the sound was played
+			let samples = [];
+			
+			// these are global so to be able to call plotGraph() from window.onresize
+			let last_list = [];
+			let last_clean = [];
+			
+			function playSound() {
+				before = Date.now();
+				beep.play();
+			}
+			
+			function feedback() {
+				play.classList.add('highlighted')
+				setTimeout(function(){
+					play.classList.remove('highlighted')
+				}, 100);
+				output.innerText = `${samples.length}`;
+			}
+			
+			function doSample() {
+				if (before && playing) {
+					const delay = Date.now() - before;
+					before = null;
+					samples.push(delay);
+					timeout = setTimeout(playSound, minDelay + Math.random() * (maxDelay - minDelay));
+					feedback();
+					return true;
+				}
+				return false;
+			}
+			
+			function isPlaying() {
+				return playing === true;
+			}
+			
+			function start() {
+				playing = true;
+				timeout = setTimeout(playSound, minDelay + Math.random() * (maxDelay - minDelay));
+				play.innerText = 'Stop';
+				base.innerText = 'Stop';
+			}
+			
+			function stop() {
+				clearTimeout(timeout);
+				playing = false;
+				showResults(samples);
+				samples = [];
+				play.innerText = 'Play';
+				base.innerText = 'Baseline';
+				play.style.display = '';
+				base.style.display = '';
+			}
+			
+			play.onclick = function() {
+				if (isPlaying()) {
+					stop();
+				} else {
+					start();
+					base.style.display = 'none';
+				}
+			}
+			
+			base.onclick = function() {
+				if (isPlaying()) {
+					stop();
+					cancelBaseline();
+				} else {
+					start();
+					calculateBaseline(doSample, stop, 30, canvas);
+					play.style.display = 'none';
+				}
+			}
+			
+			function onKeyDown(event) {
+				if (event.code === 'Escape') {
+					stop();
+					cancelBaseline();
+				} else {
+					doSample();
+				}
+			}
+			
+			if (window.matchMedia('(pointer:fine)').matches) {
+				console.log('using mouse');
+				window.onkeydown = onKeyDown;
+				window.onclick = doSample;
+			} else {
+				console.log('using finger');
+				window.addEventListener("touchstart", doSample);
+			}
+			
+			// calculates the standard deviation
+			function sigma(list) {
+				const mean = list.reduce((a,b) => a + b) / list.length;
+				return Math.sqrt(list.map((a) => Math.pow(a - mean, 2)).reduce((a,b) => a + b) / list.length);
+			}
+			
+			function average(list) {
+				return Math.round(list.reduce((a,b) => a + b) / list.length);
+			}
+			
+			function plotGraph() {
+				const list = last_list
+				const clean = last_clean
+				
+				if (list.length === 0) {
+					return;
+				}
+				
+				canvas.width = canvas.offsetWidth;
+				canvas.height = canvas.offsetHeight;
+				const ctx = canvas.getContext('2d');
+				const m = Math.max(...list)
+				const W = canvas.width;
+				const H = canvas.height;
+				const w = W / list.length;
+				const h = H / m;
+				ctx.clearRect(0, 0, W, H);
+				list.forEach(function(sample, index){
+					const x = index * w + w * 0.25;
+					const y = sample * h;
+					if (-1 !== clean.indexOf(sample)) {
+						ctx.fillStyle = "#7A7";
+					} else {
+						ctx.fillStyle = "#A77";
+					}
+					ctx.fillRect(x, H - y, w / 2, H);
+				});
+				
+				ctx.fillStyle = "#FFF";
+				ctx.strokeStyle = "#AAA";
+				[0, 0.25, 0.5, 0.75].forEach(function(v) {
+					const y = 1.0 - v;
+					ctx.beginPath();
+					ctx.moveTo(0, y * H);
+					ctx.lineTo(W, y * H);
+					ctx.stroke();
+					ctx.fillText(`${Math.round(v * m)}ms`, 0, y * H - 3);
+				});
+			}
+			
+			function showResults(list) {
+				
+				if (list.length === 0) {
+					return;
+				}
+				
+				const min_t = Math.round(Math.min(...list));
+				const max_t = Math.round(Math.max(...list));
+				const avg_t = Math.round(average(list));
+				const sig_t = Math.round(sigma(list));
+				
+				const clean = list.filter(v => Math.abs(v - avg_t) <= sig_t);
+				const min_c = Math.round(Math.min(...clean));
+				const max_c = Math.round(Math.max(...clean));
+				const avg_c = Math.round(average(clean));
+				const sig_c = Math.round(sigma(clean));
+				
+				output.innerText = `total: avg: ${avg_t}ms, min: ${min_t}ms, max: ${max_t}ms σ: ${sig_t}ms, samples: ${list.length}\nclean: avg: ${avg_c}ms, min: ${min_c}ms, max: ${max_c}ms σ: ${sig_c}ms, samples: ${clean.length}`;
+				
+				last_clean = clean;
+				last_list = list;
+				plotGraph();
+			}
+			
+			window.addEventListener('resize', plotGraph);
+			
+
+		</script>
+		
+	</body>
+</html>
